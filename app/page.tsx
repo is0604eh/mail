@@ -1,29 +1,37 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
 type Service = "lunch" | "dinner";
 type EventMode = "none" | "yes";
 
 type Inputs = {
-  // 1日情報（基本：ランチでだけ使う）
+  service: Service;
+
+  // ✅ ランチのみ必須
   weather: string;
-  eventMode: EventMode;
-  eventName: string;
+
+  // ✅ 両方必須
   customers: string[];
   customersFree: string;
 
-  // 時間帯情報（ランチ/ディナーで毎回使う）
-  service: Service;
-  seatFeel: string; // 自由入力（出力では機械語を避ける）
-  lunchPeak: string; // 例 "12-14" / "12:00-14:00"
-  dinnerPeak: string;
+  // ✅ 両方必須
+  peak: string; // 例 "12-14" / "12:00-14:00"
 
+  // ✅ 両方必須
   hits: string[];
   hitsFree: string;
 
+  // ✅ 任意（フードコート雰囲気）
+  seatFeel: string;
+
   // 任意
+  eventMode: EventMode;
+  eventName: string;
   notice: string;
+
+  // 任意（矛盾防止に使える）
+  openTime: string; // 例 "10:30"
 };
 
 const CUSTOMER_OPTIONS = [
@@ -49,15 +57,14 @@ const HIT_OPTIONS = [
   "スタッフメニュー",
 ] as const;
 
+const STORAGE_KEY = "mail-gen:free:v2";
+
 // -------------------- utils --------------------
 function normalizeText(s: string) {
   return (s ?? "").trim().replace(/\s+/g, " ");
 }
 function isBlank(s: string) {
   return normalizeText(s).length === 0;
-}
-function pick<T>(arr: T[]) {
-  return arr[Math.floor(Math.random() * arr.length)];
 }
 function unique(items: string[]) {
   return Array.from(new Set(items.map(normalizeText).filter(Boolean)));
@@ -70,12 +77,32 @@ function splitFreeText(s: string) {
     .map((x) => normalizeText(x))
     .filter(Boolean);
 }
+function pick<T>(arr: T[]) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
 function joinNatural(items: string[]) {
   const xs = unique(items);
   if (xs.length === 0) return "";
   if (xs.length === 1) return xs[0];
   if (xs.length === 2) return `${xs[0]}や${xs[1]}`;
   return `${xs.slice(0, -1).join("、")}など`;
+}
+
+// 禁止語（出力に絶対入れない）
+function sanitizeForbidden(text: string) {
+  const forbidden = [
+    "今日の流れを共有します",
+    "本日の流れを共有します",
+    "共有します",
+    "着席率",
+    "推移",
+    "回転",
+  ];
+  let t = text ?? "";
+  for (const w of forbidden) t = t.replaceAll(w, "");
+  t = t.replace(/、、+/g, "、").replace(/。。+/g, "。");
+  t = t.replace(/\s+/g, " ").trim();
+  return t;
 }
 
 // "12-14" / "12:00-14:00" -> "12時から14時"
@@ -97,41 +124,31 @@ function formatTimeRange(rangeRaw: string) {
       return t;
     }
     const hh = Number(t);
-    if (Number.isFinite(hh)) return `${hh}時`;
-    return t;
+    return Number.isFinite(hh) ? `${hh}時` : t;
   };
 
   const start = toJP(startRaw);
   const end = toJP(endRaw);
-  if (!start || !end) return range;
-  return `${start}から${end}`;
+  return start && end ? `${start}から${end}` : range;
 }
 
-// "19-20" -> "19時"（ディナーは開始時刻だけ使うと人間っぽい）
-function formatStartTime(rangeRaw: string) {
-  const range = normalizeText(rangeRaw);
-  if (!range) return "";
-  if (!range.includes("-")) return range;
+// "12-14" -> 12, "12:00-14:00" -> 12
+function parseStartHour(peakRaw: string) {
+  const range = normalizeText(peakRaw);
+  const start = range.split("-")[0]?.trim() ?? "";
+  const hStr = start.includes(":") ? start.split(":")[0] : start;
+  const h = Number(hStr);
+  return Number.isFinite(h) ? h : null;
+}
 
-  const [startRaw] = range.split("-").map((x) => x.trim());
-
-  const toJP = (t: string) => {
-    if (!t) return "";
-    if (t.includes(":")) {
-      const [h, m] = t.split(":");
-      const hh = Number(h);
-      const mm = Number(m);
-      if (Number.isFinite(hh) && Number.isFinite(mm)) {
-        return mm === 0 ? `${hh}時` : `${hh}時${mm}分`;
-      }
-      return t;
-    }
-    const hh = Number(t);
-    if (Number.isFinite(hh)) return `${hh}時`;
-    return t;
-  };
-
-  return toJP(startRaw);
+// ✅ 「穏やかなスタート」を出して良い条件
+// - ランチのみ
+// - ピーク開始が12時以降
+function canSayGentleStart(i: Inputs) {
+  if (i.service !== "lunch") return false;
+  const h = parseStartHour(i.peak);
+  if (h === null) return false;
+  return h >= 12;
 }
 
 type CrowdLevel = "busy" | "normal" | "quiet";
@@ -139,340 +156,290 @@ type CrowdLevel = "busy" | "normal" | "quiet";
 function inferCrowdLevel(seatFeelRaw: string): CrowdLevel {
   const s = normalizeText(seatFeelRaw);
 
-  // 忙しい寄り
   if (
-    /満席|ぎゅうぎゅう|混み|混ん|行列|立て込|ばたつ|9割|8割|7割後半|80%|90%/i.test(
-      s
-    )
-  )
+    /満席|混み|混ん|行列|立て込|立て込み|ばたつ|ぎゅうぎゅう|詰ま/i.test(s)
+  ) {
     return "busy";
-
-  // 空いてる寄り
-  if (/空席|空いて|ガラガラ|落ち着|暇|3割|2割|20%|30%|40%/i.test(s))
+  }
+  if (/空席|空いて|ガラガラ|落ち着|暇|ゆったり/i.test(s)) {
     return "quiet";
-
+  }
   return "normal";
 }
 
-// 体感文（主語を必ず「フードコート内」にする）
-function feelClause(seatFeelRaw: string) {
-  const feel = normalizeText(seatFeelRaw);
-  if (!feel) return "";
-  return pick([
-    `フードコート内は体感で「${feel}」くらいの混み具合でした。`,
-    `フードコート内の混み具合は、体感で「${feel}」に近い印象でした。`,
-  ]);
-}
-
-// 文章の最後に軽く整形（事故を減らす）
+// 文章の仕上げ（事故を減らす）
 function polishJapanese(text: string) {
-  let t = text;
-  t = t.replace(/、、+/g, "、").replace(/。。+/g, "。");
+  let t = sanitizeForbidden(text);
   t = t.replace(/、で、/g, "、");
   t = t.replace(/  +/g, " ");
+  t = t.replace(/。+/g, "。");
   return t.trim();
 }
 
-// -------------------- prediction --------------------
-// 天気×客層×売れ筋から「人間が書きそうな予測コメント」を最大1文だけ足す
-function predictSentence(i: Inputs) {
-  const weather = normalizeText(i.weather);
-  const customers = unique([...i.customers, ...splitFreeText(i.customersFree)]);
-  const hits = unique([...i.hits, ...splitFreeText(i.hitsFree)]);
-
-  const isGoodWeather = /晴|快晴|日差し|暖|ぽかぽか|暑/i.test(weather);
-  const isBadWeather = /雨|雪|風|寒|荒れ/i.test(weather);
-
-  const hasFamily = customers.some((c) => /家族|親子|ベビーカー/i.test(c));
-  const hasTourist = customers.some((c) => /観光/i.test(c));
-  const hasStudents = customers.some((c) => /学生|部活/i.test(c));
-
-  const hasTakeout = hits.some((h) => /持ち帰り|テイク/i.test(h));
-  const hasSet = hits.some((h) => /セット/i.test(h));
-  const hasKaraage = hits.some((h) => /から揚げ|からあげ/i.test(h));
-
-  const cand: string[] = [];
-
-  if (hasFamily) {
-    cand.push(
-      pick([
-        "家族連れが多い日は、2点以上の注文やセットが入りやすい流れでした。",
-        "家族連れが多かった分、複数点の注文やセットが増えやすい印象でした。",
-      ])
-    );
-  }
-
-  if (isGoodWeather && !hasTakeout) {
-    cand.push(
-      pick([
-        "天気が良い日は持ち帰りが伸びやすいので、テイクアウト系の動きも意識したいです。",
-        "天気が良い日は持ち帰りが増えがちなので、テイクアウトの準備も厚めにしておきたいです。",
-      ])
-    );
-  }
-
-  if (isBadWeather) {
-    cand.push(
-      pick([
-        "天候が崩れる日は館内利用が増えやすいので、ピーク前の段取りを早めに揃えたいです。",
-        "悪天候の日は客足の寄り方が変わりやすいので、ピーク前に一度整えておきたいです。",
-      ])
-    );
-  }
-
-  if (hasSet) {
-    cand.push(
-      pick([
-        "セットが強い日は作業が重なりやすいので、ピーク前の準備が効きました。",
-        "セットが多い日は提供が詰まりやすいので、ピーク前に手順を揃えると回しやすいです。",
-      ])
-    );
-  }
-
-  if (hasKaraage) {
-    cand.push(
-      pick([
-        "から揚げは追加注文が入りやすいので、ピーク前に一度整えておくと安心でした。",
-        "から揚げが動く日は追加が入りやすいので、揚げのリズムを崩さないのが大事でした。",
-      ])
-    );
-  }
-
-  if (hasTourist) {
-    cand.push(
-      pick([
-        "観光客が多い日は、最初の案内と注文確認を丁寧にすると流れが安定しやすいです。",
-        "観光客が多い日は、注文確認を揃えると後がスムーズでした。",
-      ])
-    );
-  }
-
-  if (hasStudents) {
-    cand.push(
-      pick([
-        "学生が多い日は単品が早く動きやすいので、仕込みの見え方を意識したいです。",
-        "学生が多い日は回転が早くなりやすいので、ピーク前の準備が効きました。",
-      ])
-    );
-  }
-
-  const uniq = Array.from(new Set(cand.map(normalizeText))).filter(Boolean);
-  return uniq.length ? pick(uniq) : "";
+// 2〜3文に抑える：句点数を調整（最大3文）
+function clampTo3Sentences(text: string) {
+  const t = polishJapanese(text);
+  const parts = t.split("。").map((x) => x.trim()).filter(Boolean);
+  if (parts.length <= 3) return t;
+  return `${parts.slice(0, 3).join("。")}。`;
 }
 
-// -------------------- human-like builders --------------------
-function lunchSentenceHuman(i: Inputs) {
-  const weather = normalizeText(i.weather);
-  const peak = formatTimeRange(i.lunchPeak);
-  const customers = joinNatural([
-    ...i.customers,
-    ...splitFreeText(i.customersFree),
-  ]);
-  const hits = unique([...i.hits, ...splitFreeText(i.hitsFree)]);
-  const level = inferCrowdLevel(i.seatFeel);
+// -------------------- template engine (no LLM) --------------------
 
-  const eventName = normalizeText(i.eventName);
-  const hasEvent = i.eventMode === "yes";
-  const eventPhrase = hasEvent
-    ? eventName
+// ✅ ランチ：天気必須 / 片づけ禁止 / 「共有」系禁止 / 2〜3文へ統合
+function buildLunchText(i: Inputs, customersMerged: string[], hitsMerged: string[]) {
+  const weather = normalizeText(i.weather);
+  const customersText = joinNatural(customersMerged);
+  const hits = hitsMerged;
+  const peakJP = formatTimeRange(i.peak);
+  const seatFeel = normalizeText(i.seatFeel);
+  const crowd = inferCrowdLevel(seatFeel);
+
+  const eventName = i.eventMode === "yes" ? normalizeText(i.eventName) : "";
+  const notice = normalizeText(i.notice);
+
+  // ---- ① 導入（天気＋立ち上がり） ----
+  const intro = (() => {
+    const head = pick([
+      `天気は${weather}で、`,
+      `天気が${weather}で、`,
+      `天気は${weather}でした。`,
+    ]);
+
+    if (head.endsWith("。")) {
+      // 「天気は晴れでした。」タイプのときは次節を繋げて1文に寄せる
+      const next =
+        canSayGentleStart(i)
+          ? pick(["立ち上がりは落ち着いた入りでした。", "序盤は比較的穏やかでした。"])
+          : pick(["早い時間帯から動きが出ていました。", "序盤から注文が入りやすい流れでした。"]);
+      return `${head} ${next}`;
+    }
+
+    const tail =
+      canSayGentleStart(i)
+        ? pick(["立ち上がりは落ち着いた入りでした。", "序盤は比較的穏やかでした。", "出だしは落ち着いた入りでした。"])
+        : pick(["早い時間帯から動きが出ていました。", "序盤から店前がにぎわいました。", "早めの時間から注文が入りやすい日でした。"]);
+
+    return `${head}${tail}`;
+  })();
+
+  // ---- ② 客層＋ピーク（1文にまとめる） ----
+  const mid = (() => {
+    const customerClause = customersText
       ? pick([
-          `（${eventName}の影響もあって）`,
-          `（${eventName}もあったため）`,
-          `（${eventName}が入っていたこともあり）`,
+          `${customersText}の来店が目立ち、`,
+          `${customersText}が多い印象で、`,
+          `${customersText}が中心で、`,
         ])
-      : pick(["（イベント日ということもあり）", "（催しが入っていたこともあり）"])
-    : "";
+      : ""; // 必須だが保険
 
-  const parts: string[] = [];
+    const peakClause = peakJP
+      ? pick([
+          `${peakJP}にかけて注文が重なりました。`,
+          `${peakJP}あたりが一番立て込みました。`,
+          `${peakJP}頃がピークでした。`,
+        ])
+      : "ピークの波がありました。";
 
-  // 1文目：天気→スタート（＋イベント）
-  if (weather) {
-    parts.push(
-      pick([
-        `天気が良かった影響か、穏やかにスタートしました。`,
-        `天気が${weather}だった影響か、穏やかにスタートしました。`,
-        `天気が${weather}で、落ち着いてスタートしました。`,
-      ]) + (eventPhrase ? ` ${eventPhrase}` : "")
-    );
-  } else {
-    parts.push(
-      pick(["穏やかにスタートしました。", "落ち着いてスタートしました。"]) +
-        (eventPhrase ? ` ${eventPhrase}` : "")
-    );
-  }
+    // 「目立ち、〜」のように読点で繋ぐ
+    return `${customerClause}${peakClause}`;
+  })();
 
-  // 2文目：客層
-  if (customers) {
-    parts.push(
-      pick([
-        `${customers}の来店が多く、フードコート内はゆるやかに賑わっていました。`,
-        `${customers}の来店が多い印象でした。`,
-        `${customers}が多く、にぎわいが出ていました。`,
-      ])
-    );
-  }
+  // ---- ③ 全体印象＋売れ筋＋（任意で雰囲気/イベント/連絡） ----
+  const end = (() => {
+    const base =
+      crowd === "busy"
+        ? pick([
+            "立て込みましたが、崩れるほどではなく回せています。",
+            "注文が重なる場面はありましたが、大きな混乱はありませんでした。",
+          ])
+        : crowd === "quiet"
+        ? pick([
+            "比較的落ち着いて対応できました。",
+            "落ち着いた時間帯が多めでした。",
+          ])
+        : pick([
+            "波はありつつも無理なく回せた印象です。",
+            "ほどよい動きの中で回せました。",
+          ]);
 
-  // 3文目：ピーク
-  if (!isBlank(peak)) {
-    parts.push(
-      pick([
-        `${peak}までピークが続きました。`,
-        `${peak}にかけてピークが続きました。`,
-        `${peak}あたりが一番立て込みました。`,
-      ])
-    );
-  }
+    const hitClause =
+      hits.length > 0
+        ? (() => {
+            const a = hits[0];
+            const b = hits[1];
+            const text = b ? `${a}と${b}` : a;
+            return pick([
+              `${text}が多めに出ています。`,
+              `${text}の注文が目立ちました。`,
+              `${text}がよく動きました。`,
+            ]);
+          })()
+        : "";
 
-  // 4文目：混み具合（“軸”は必ず level で固定し、体感は補足に回す）
-  const crowdByLevel: Record<CrowdLevel, string[]> = {
-    busy: [
-      "注文が重なる時間帯が多く、手が止まらない感じでした。",
-      "慌ただしい時間帯が続きましたが、大きな混乱なく対応できました。",
-      "立て込みましたが、崩れるほどではなく回せています。",
-    ],
-    normal: [
-      "波はありつつも、無理なく回せた印象です。",
-      "ほどよく動きのある時間帯でした。",
-      "全体としては安定した流れでした。",
-    ],
-    quiet: [
-      "比較的落ち着いていて、ゆとりを持って対応できました。",
-      "落ち着いた雰囲気で、仕込みや片付けも進められました。",
-      "全体的にゆったり進みました。",
-    ],
-  };
+    // 雰囲気は“補足”として末尾に任意で載せる（矛盾しにくい）
+    const feelClause = seatFeel
+      ? pick([
+          `フードコート内は体感で「${seatFeel}」くらいでした。`,
+          `フードコート内は「${seatFeel}」に近い印象でした。`,
+        ])
+      : "";
 
-  parts.push(pick(crowdByLevel[level]));
-  if (!isBlank(i.seatFeel) && pick([true, false, false])) {
-    parts.push(feelClause(i.seatFeel));
-  }
+    const eventClause = eventName
+      ? pick([`（${eventName}も入っていました）`, `（${eventName}が入っていました）`])
+      : "";
 
-  // 5文目：売れ筋
-  if (hits.length > 0) {
-    const a = hits[0];
-    const b = hits[1];
-    const text = b ? `${a}と${b}` : a;
-    parts.push(
-      pick([
-        `${text}がいつもより多かったです。`,
-        `${text}が多めに出ています。`,
-        `${text}の注文が目立ちました。`,
-      ])
-    );
-  }
+    // 連絡事項は最後に別枠（短く）
+    const noticeClause = notice ? `連絡事項：${notice}` : "";
 
-  // 予測コメント（最大1文）
-  const pred = predictSentence(i);
-  if (!isBlank(pred) && pick([true, false])) {
-    parts.push(pred);
-  }
+    // 文章の伸びすぎ防止：雰囲気/イベントはどちらか片方に寄せる
+    const extra = pick([
+      feelClause,
+      eventClause,
+      "", // 何も付けないパターンも残す
+    ]);
 
-  // 連絡事項（任意）
-  const notice = normalizeText(i.notice);
-  if (notice) {
-    parts.push(
-      pick([
-        `連絡事項：${notice}`,
-        `共有：${notice}`,
-        `念のため共有します。${notice}`,
-      ])
-    );
-  }
+    // base と hitClause は同一文にまとめる
+    const baseAndHit = (() => {
+      if (!hitClause) return base;
+      // baseの句点を外して読点接続
+      const baseNoDot = base.replace(/。$/, "");
+      return `${baseNoDot}、${hitClause}`;
+    })();
 
-  return polishJapanese(parts.join(" "));
+    // 連絡事項がある場合は最後に別文で付けやすい
+    const chunks = [baseAndHit];
+    if (extra) chunks.push(extra);
+    if (noticeClause) chunks.push(noticeClause);
+
+    return chunks.join(" ");
+  })();
+
+  // ランチは「片づけ」絶対排除
+  let out = `${intro} ${mid} ${end}`.replace(/片づけ|片付け/g, "");
+  out = clampTo3Sentences(out);
+  return polishJapanese(out);
 }
 
-function dinnerSentenceHuman(i: Inputs) {
-  const peakStart = formatStartTime(i.dinnerPeak);
-  const hits = unique([...i.hits, ...splitFreeText(i.hitsFree)]);
-  const level = inferCrowdLevel(i.seatFeel);
+// ✅ ディナー：天気は出さない / 2〜3文へ統合 / 「片づけ」は落ち着き寄りの時だけ
+function buildDinnerText(i: Inputs, customersMerged: string[], hitsMerged: string[]) {
+  const customersText = joinNatural(customersMerged);
+  const hits = hitsMerged;
+  const peakJP = formatTimeRange(i.peak);
+  const seatFeel = normalizeText(i.seatFeel);
+  const crowd = inferCrowdLevel(seatFeel);
 
-  const parts: string[] = [];
-
-  // 1文目：導入（混み具合に合わせて矛盾を消す）
-  const introByLevel: Record<CrowdLevel, string[]> = {
-    busy: [
-      "後半もかなり混み、店前の動きが多い時間帯でした。",
-      "夕方以降も立て込み、慌ただしい流れでした。",
-      "夜も混みが続き、忙しい時間帯が多かったです。",
-    ],
-    normal: [
-      "ランチと違い、ほどよい混み具合でした。",
-      "後半は、比較的落ち着いた雰囲気でした。",
-      "夕方以降は、無理のない混み具合でした。",
-    ],
-    quiet: [
-      "ランチに比べると落ち着いていて、ゆったり対応できました。",
-      "後半は静かめで、余裕を持って進められました。",
-      "夕方以降は落ち着いた雰囲気でした。",
-    ],
-  };
-  parts.push(pick(introByLevel[level]));
-
-  // 2文目：ピーク（開始だけ）
-  if (!isBlank(peakStart)) {
-    parts.push(
-      pick([
-        `${peakStart}からピークがありました。`,
-        `${peakStart}あたりで注文が重なる場面がありました。`,
-      ])
-    );
-  }
-
-  // 3文目：混み具合（“軸”固定＋体感は補足）
-  const crowdByLevel: Record<CrowdLevel, string[]> = {
-    busy: [
-      "一時的にかなり立て込みましたが、崩れるほどではありませんでした。",
-      "忙しい時間帯もありましたが、大きな混乱はありませんでした。",
-    ],
-    normal: [
-      "波はありつつも、無理なく回せた印象です。",
-      "ほどよい混み具合でした。",
-    ],
-    quiet: [
-      "全体的にゆったりした流れでした。",
-      "落ち着いた時間帯が多めでした。",
-    ],
-  };
-  parts.push(pick(crowdByLevel[level]));
-  if (!isBlank(i.seatFeel) && pick([true, false, false])) {
-    parts.push(feelClause(i.seatFeel));
-  }
-
-  // 4文目：売れ筋
-  if (hits.length > 0) {
-    parts.push(
-      pick([
-        `${hits[0]}を頼まれるお客様が多かったです。`,
-        `${hits[0]}を頼まれるお客様が多かった印象です。`,
-        `${hits[0]}の注文が多めでした。`,
-      ])
-    );
-  }
-
-  // 予測コメント（最大1文）
-  const pred = predictSentence(i);
-  if (!isBlank(pred) && pick([true, false])) {
-    parts.push(pred);
-  }
-
-  // 連絡事項（任意）
+  const eventName = i.eventMode === "yes" ? normalizeText(i.eventName) : "";
   const notice = normalizeText(i.notice);
-  if (notice) {
-    parts.push(
-      pick([
-        `連絡事項：${notice}`,
-        `共有：${notice}`,
-        `念のため共有します。${notice}`,
-      ])
-    );
-  }
 
-  return polishJapanese(parts.join(" "));
+  // ---- ① 導入＋客層 ----
+  const intro = (() => {
+    const head = pick(
+      crowd === "busy"
+        ? ["夕方以降も立て込み、", "夜も動きが多く、", "後半も注文が重なりやすく、"]
+        : crowd === "quiet"
+        ? ["夕方以降は落ち着いた雰囲気で、", "後半は比較的落ち着いて、", "夜は静かめで、"]
+        : ["夕方以降はほどよい混み具合で、", "後半は無理のない流れで、", "夜はほどよい動きで、"]
+    );
+
+    const customerClause = customersText
+      ? pick([
+          `${customersText}の来店が目立ちました。`,
+          `${customersText}が多い印象でした。`,
+        ])
+      : "来店がありました。";
+
+    return `${head}${customerClause}`;
+  })();
+
+  // ---- ② ピーク＋雰囲気（任意） ----
+  const mid = (() => {
+    const peakClause = peakJP
+      ? pick([
+          `${peakJP}あたりで注文が重なりました。`,
+          `${peakJP}頃がピークでした。`,
+          `${peakJP}にかけて立て込みました。`,
+        ])
+      : pick(["ピークの波がありました。", "時間帯で波がありました。"]);
+
+    const feelClause = seatFeel
+      ? pick([
+          `フードコート内は体感で「${seatFeel}」くらいでした。`,
+          `フードコート内は「${seatFeel}」に近い印象でした。`,
+        ])
+      : "";
+
+    return feelClause ? `${peakClause} ${feelClause}` : peakClause;
+  })();
+
+  // ---- ③ 全体印象＋売れ筋＋（条件で片づけ）＋（任意でイベント/連絡） ----
+  const end = (() => {
+    const base =
+      crowd === "busy"
+        ? pick([
+            "忙しい時間帯もありましたが、大きな混乱はありませんでした。",
+            "立て込みましたが、崩れるほどではありませんでした。",
+          ])
+        : crowd === "quiet"
+        ? pick([
+            "落ち着いた時間帯が多めでした。",
+            "比較的落ち着いて対応できました。",
+          ])
+        : pick([
+            "波はありつつも無理なく回せた印象です。",
+            "ほどよい動きの中で対応できました。",
+          ]);
+
+    const hitClause =
+      hits.length > 0
+        ? (() => {
+            const a = hits[0];
+            const b = hits[1];
+            const text = b ? `${a}と${b}` : a;
+            return pick([
+              `${text}の注文が目立ちました。`,
+              `${text}が多めに出ています。`,
+              `${text}がよく動きました。`,
+            ]);
+          })()
+        : "";
+
+    const cleanupClause =
+      crowd === "quiet"
+        ? pick(["仕込みや片づけも進められました。", "片づけまで含めて整えやすい日でした。"])
+        : "";
+
+    const eventClause = eventName
+      ? pick([`（${eventName}も入っていました）`, `（${eventName}が入っていました）`])
+      : "";
+
+    const noticeClause = notice ? `連絡事項：${notice}` : "";
+
+    const baseAndHit = (() => {
+      if (!hitClause) return base;
+      const baseNoDot = base.replace(/。$/, "");
+      return `${baseNoDot}、${hitClause}`;
+    })();
+
+    // 伸びすぎ防止：event と cleanup はどちらか片方に寄せる
+    const extra = pick([cleanupClause, eventClause, ""]);
+
+    const chunks = [baseAndHit];
+    if (extra) chunks.push(extra);
+    if (noticeClause) chunks.push(noticeClause);
+
+    return chunks.join(" ");
+  })();
+
+  let out = `${intro} ${mid} ${end}`;
+  out = clampTo3Sentences(out);
+  return polishJapanese(out);
 }
 
-function buildDailyMail(i: Inputs) {
-  return i.service === "lunch" ? lunchSentenceHuman(i) : dinnerSentenceHuman(i);
+function buildDailyMail(i: Inputs, customersMerged: string[], hitsMerged: string[]) {
+  return i.service === "lunch"
+    ? buildLunchText(i, customersMerged, hitsMerged)
+    : buildDinnerText(i, customersMerged, hitsMerged);
 }
 
 // -------------------- UI components --------------------
@@ -531,8 +498,6 @@ function MultiSelect({
   );
 }
 
-const STORAGE_KEY = "mail-gen:v2";
-
 function safeParse<T>(s: string | null): T | null {
   if (!s) return null;
   try {
@@ -544,34 +509,32 @@ function safeParse<T>(s: string | null): T | null {
 
 export default function Page() {
   const [inputs, setInputs] = useState<Inputs>({
+    service: "lunch",
     weather: "",
-    eventMode: "none",
-    eventName: "",
+
     customers: [],
     customersFree: "",
 
-    service: "lunch",
-    seatFeel: "",
-    lunchPeak: "",
-    dinnerPeak: "",
+    peak: "",
 
     hits: [],
     hitsFree: "",
 
+    seatFeel: "",
+
+    eventMode: "none",
+    eventName: "",
     notice: "",
+    openTime: "10:30",
   });
 
   const [output, setOutput] = useState("");
   const [toast, setToast] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // ✅ 修正案A：previewHintは「マウント後」に生成（SSR時にMath.randomが走らないようにする）
-  const [mounted, setMounted] = useState(false);
-  const [previewHint, setPreviewHint] = useState("");
-
   // restore
   useEffect(() => {
-    const saved = safeParse<Inputs>(localStorage.getItem(STORAGE_KEY));
+    const saved = safeParse<Partial<Inputs>>(localStorage.getItem(STORAGE_KEY));
     if (saved) setInputs((p) => ({ ...p, ...saved }));
   }, []);
 
@@ -590,54 +553,36 @@ export default function Page() {
     return () => window.clearTimeout(id);
   }, [toast]);
 
-  // mounted flag
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const customersMerged = useMemo(
+    () => unique([...inputs.customers, ...splitFreeText(inputs.customersFree)]),
+    [inputs.customers, inputs.customersFree]
+  );
 
-  // ✅ preview generation (client only)
-  useEffect(() => {
-    if (!mounted) return;
+  const hitsMerged = useMemo(
+    () => unique([...inputs.hits, ...splitFreeText(inputs.hitsFree)]),
+    [inputs.hits, inputs.hitsFree]
+  );
 
-    const sample: Inputs =
-      inputs.service === "lunch"
-        ? {
-            ...inputs,
-            weather: inputs.weather || "晴れ",
-            customers: inputs.customers.length
-              ? inputs.customers
-              : ["家族連れ", "観光客"],
-            lunchPeak: inputs.lunchPeak || "12-14",
-            seatFeel: inputs.seatFeel || "満席",
-            hits: inputs.hits.length ? inputs.hits : ["親子丼", "親子丼セット"],
-            eventMode: inputs.eventMode,
-            eventName:
-              inputs.eventMode === "yes" ? inputs.eventName || "三連休" : "",
-          }
-        : {
-            ...inputs,
-            dinnerPeak: inputs.dinnerPeak || "19-20",
-            seatFeel: inputs.seatFeel || "満席",
-            hits: inputs.hits.length ? inputs.hits : ["から揚げ"],
-          };
-
-    setPreviewHint(buildDailyMail(sample));
-  }, [mounted, inputs]);
-
-  const peakValue =
-    inputs.service === "lunch" ? inputs.lunchPeak : inputs.dinnerPeak;
-  const setPeakValue = (v: string) => {
-    setInputs((p) =>
-      p.service === "lunch" ? { ...p, lunchPeak: v } : { ...p, dinnerPeak: v }
-    );
+  const validate = () => {
+    const errs: string[] = [];
+    if (inputs.service === "lunch" && isBlank(inputs.weather))
+      errs.push("ランチは天気が必須");
+    if (customersMerged.length === 0) errs.push("客層は必須");
+    if (isBlank(inputs.peak)) errs.push("ピーク時間は必須");
+    if (hitsMerged.length === 0) errs.push("売れ筋は必須");
+    return errs;
   };
 
-  const peakPlaceholder =
-    inputs.service === "lunch"
-      ? "例）12-14 / 12:00-14:00"
-      : "例）19-20 / 19:00-20:00";
+  const isReadyToGenerate = validate().length === 0;
 
-  const generate = () => setOutput(buildDailyMail(inputs));
+  const generate = () => {
+    const errs = validate();
+    if (errs.length) {
+      setToast(errs[0]);
+      return;
+    }
+    setOutput(buildDailyMail(inputs, customersMerged, hitsMerged));
+  };
 
   const copy = async () => {
     if (!output) return;
@@ -669,18 +614,18 @@ export default function Page() {
   const resetAll = () => {
     localStorage.removeItem(STORAGE_KEY);
     setInputs({
+      service: "lunch",
       weather: "",
-      eventMode: "none",
-      eventName: "",
       customers: [],
       customersFree: "",
-      service: "lunch",
-      seatFeel: "",
-      lunchPeak: "",
-      dinnerPeak: "",
+      peak: "",
       hits: [],
       hitsFree: "",
+      seatFeel: "",
+      eventMode: "none",
+      eventName: "",
       notice: "",
+      openTime: "10:30",
     });
     setOutput("");
     setToast("クリアしました");
@@ -706,10 +651,10 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [output, inputs]);
 
-  const isReadyToGenerate =
-    !isBlank(inputs.seatFeel) &&
-    !isBlank(peakValue) &&
-    (!isBlank(inputs.hitsFree) || inputs.hits.length > 0);
+  const peakPlaceholder =
+    inputs.service === "lunch"
+      ? "例）12-14 / 12:00-14:00（11- のとき“穏やかスタート”は出さない）"
+      : "例）19-20 / 19:00-20:00";
 
   return (
     <main className="min-h-screen bg-gray-50 text-black">
@@ -722,11 +667,10 @@ export default function Page() {
       <div className="max-w-4xl mx-auto p-6 md:p-10 space-y-6">
         <header className="space-y-2">
           <h1 className="text-2xl md:text-3xl font-bold">
-            日報メール文 自動生成
+            らくらくめーる
           </h1>
           <p className="text-sm text-gray-600">
-            ランチは「1日の始まり」っぽく、ディナーは「続き」っぽく自然文で出す。
-            （Cmd/Ctrl+Enterで生成、Cmd/Ctrl+Shift+Cでコピー）
+            ルール＋文法テンプレで自然文を2〜3文にまとめて生成。（Cmd/Ctrl+Enterで生成、Cmd/Ctrl+Shift+Cでコピー）
           </p>
         </header>
 
@@ -744,7 +688,6 @@ export default function Page() {
                     ? "bg-black text-white"
                     : "text-black hover:bg-gray-100",
                 ].join(" ")}
-                aria-pressed={inputs.service === "lunch"}
               >
                 ランチ
               </button>
@@ -757,7 +700,6 @@ export default function Page() {
                     ? "bg-black text-white"
                     : "text-black hover:bg-gray-100",
                 ].join(" ")}
-                aria-pressed={inputs.service === "dinner"}
               >
                 ディナー
               </button>
@@ -780,41 +722,57 @@ export default function Page() {
             </button>
           </div>
 
-          {/* 必須：混み具合・ピーク・売れ筋 */}
-          <div className="grid md:grid-cols-2 gap-4">
+          {/* ✅ ランチ：天気必須 */}
+          {inputs.service === "lunch" && (
             <div className="space-y-2">
-              <label className="text-sm font-medium">
-                フードコートの雰囲気（必須）
-              </label>
+              <label className="text-sm font-medium">天気（ランチ必須）</label>
               <input
                 className="w-full rounded-xl border px-3 py-2"
-                placeholder="例）満席 / 席は埋まり気味 / 落ち着いてた / 行列あり"
-                value={inputs.seatFeel}
+                placeholder="例）晴れ / くもり / 雨 / 風強め"
+                value={inputs.weather}
                 onChange={(e) =>
-                  setInputs((p) => ({ ...p, seatFeel: e.target.value }))
+                  setInputs((p) => ({ ...p, weather: e.target.value }))
                 }
               />
-              <p className="text-xs text-gray-500">
-                ※ 出力では「着席率」「推移」「回転」などの機械語は使わない
-              </p>
             </div>
+          )}
 
-            <div className="space-y-2">
-              <label className="text-sm font-medium">
-                ピーク時間（必須）
-              </label>
-              <input
-                className="w-full rounded-xl border px-3 py-2"
-                placeholder={peakPlaceholder}
-                value={peakValue}
-                onChange={(e) => setPeakValue(e.target.value)}
-              />
-              <p className="text-xs text-gray-500 mt-1">
-                出力では「12-14」→「12時から14時」のように自然表現に変換
-              </p>
+          {/* ✅ 客層（両方必須） */}
+          <div className="space-y-3">
+            <div className="flex items-end justify-between gap-3">
+              <label className="text-sm font-medium">客層（必須）</label>
+              <span className="text-xs text-gray-500">＋ 手入力OK</span>
             </div>
+            <MultiSelect
+              options={CUSTOMER_OPTIONS}
+              value={inputs.customers}
+              onChange={(v) => setInputs((p) => ({ ...p, customers: v }))}
+            />
+            <input
+              className="w-full rounded-xl border px-3 py-2"
+              placeholder="手入力（例）ベビーカー多め、部活帰り など"
+              value={inputs.customersFree}
+              onChange={(e) =>
+                setInputs((p) => ({ ...p, customersFree: e.target.value }))
+              }
+            />
           </div>
 
+          {/* ✅ ピーク（両方必須） */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">ピーク時間（必須）</label>
+            <input
+              className="w-full rounded-xl border px-3 py-2"
+              placeholder={peakPlaceholder}
+              value={inputs.peak}
+              onChange={(e) => setInputs((p) => ({ ...p, peak: e.target.value }))}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              出力では「12-14」→「12時から14時」のように自然表現に変換
+            </p>
+          </div>
+
+          {/* ✅ 売れ筋（両方必須） */}
           <div className="space-y-3">
             <div className="flex items-end justify-between gap-3">
               <label className="text-sm font-medium">売れ筋（必須）</label>
@@ -837,27 +795,28 @@ export default function Page() {
             />
           </div>
 
+          {/* ✅ フードコート雰囲気（任意） */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">
+              フードコート内の雰囲気（任意）
+            </label>
+            <input
+              className="w-full rounded-xl border px-3 py-2"
+              placeholder="例）満席 / 席は埋まり気味 / 落ち着いてた / 行列あり"
+              value={inputs.seatFeel}
+              onChange={(e) =>
+                setInputs((p) => ({ ...p, seatFeel: e.target.value }))
+              }
+            />
+            <p className="text-xs text-gray-500">
+              ※ 出力では「着席率」「推移」「回転」などの機械語は使わない
+            </p>
+          </div>
+
           {/* 詳細（任意） */}
           {showAdvanced && (
             <div className="pt-2 space-y-5">
               <div className="grid md:grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">
-                    天気（任意・主にランチ向け）
-                  </label>
-                  <input
-                    className="w-full rounded-xl border px-3 py-2"
-                    placeholder="例）晴れ / くもり / 雨 / 風強め"
-                    value={inputs.weather}
-                    onChange={(e) =>
-                      setInputs((p) => ({ ...p, weather: e.target.value }))
-                    }
-                  />
-                  <p className="text-xs text-gray-500">
-                    ※ ディナーでは天気は基本出さない（続きの文章になる）
-                  </p>
-                </div>
-
                 <div className="space-y-2">
                   <label className="text-sm font-medium">イベント（任意）</label>
                   <div className="flex items-center gap-2">
@@ -887,28 +846,18 @@ export default function Page() {
                     />
                   )}
                 </div>
-              </div>
 
-              <div className="space-y-3">
-                <div className="flex items-end justify-between gap-3">
-                  <label className="text-sm font-medium">客層（任意）</label>
-                  <span className="text-xs text-gray-500">＋ 手入力OK</span>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">開店時刻（任意）</label>
+                  <input
+                    className="w-full rounded-xl border px-3 py-2"
+                    placeholder="例）10:30"
+                    value={inputs.openTime}
+                    onChange={(e) =>
+                      setInputs((p) => ({ ...p, openTime: e.target.value }))
+                    }
+                  />
                 </div>
-                <MultiSelect
-                  options={CUSTOMER_OPTIONS}
-                  value={inputs.customers}
-                  onChange={(v) =>
-                    setInputs((p) => ({ ...p, customers: v }))
-                  }
-                />
-                <input
-                  className="w-full rounded-xl border px-3 py-2"
-                  placeholder="手入力（例）ベビーカー多め、部活帰り など"
-                  value={inputs.customersFree}
-                  onChange={(e) =>
-                    setInputs((p) => ({ ...p, customersFree: e.target.value }))
-                  }
-                />
               </div>
 
               <div className="space-y-2">
@@ -932,11 +881,7 @@ export default function Page() {
               onClick={generate}
               disabled={!isReadyToGenerate}
               className="px-5 py-2 rounded-xl bg-black text-white hover:opacity-90 disabled:opacity-50"
-              title={
-                isReadyToGenerate
-                  ? ""
-                  : "混み具合・ピーク・売れ筋（選択or手入力）を入れると生成できます"
-              }
+              title={isReadyToGenerate ? "" : validate()[0]}
             >
               生成
             </button>
@@ -974,13 +919,6 @@ export default function Page() {
                 ランチ入力へ
               </button>
             )}
-          </div>
-
-          <div className="pt-2 text-xs text-gray-500">
-            生成イメージ：
-            <div className="mt-2 whitespace-pre-wrap rounded-xl border bg-gray-50 p-3 text-gray-700">
-              {mounted ? previewHint : "（プレビューを表示中…）"}
-            </div>
           </div>
         </section>
 
